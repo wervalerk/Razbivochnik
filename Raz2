@@ -1,0 +1,548 @@
+import asyncio
+import os
+from html import escape
+
+import ezdxf
+from ezdxf.math import Vec3
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message, CallbackQuery, FSInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, LongTable, TableStyle, Paragraph, Spacer
+)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+TOKEN = "ВАШ_ТОКЕН"
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# ======== ЧТО ЕЩЁ МОЖНО ПОДКЛЮЧИТЬ (False = поведение как раньше) ========
+INCLUDE_SPLINES = False   # SPLINE / HELIX -> точки по кривой (нужен ezdxf >= 1.0)
+INCLUDE_BLOCKS  = False   # полилинии внутри INSERT, включая вложенные блоки
+INCLUDE_LINES   = False   # концы LINE + отдельные POINT
+# ========================================================================
+
+# ================= Шрифт для PDF =================
+def register_font():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (
+        os.path.join(here, "DejaVuSans.ttf"),
+        os.path.join(here, "fonts", "DejaVuSans.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ):
+        if os.path.exists(p):
+            try:
+                pdfmetrics.registerFont(TTFont("Geo", p))
+                return "Geo", True
+            except Exception:
+                pass
+    return "Helvetica", False
+
+FONT, CYRILLIC = register_font()
+
+def pdf_safe(v):
+    if CYRILLIC:
+        return str(v)
+    return str(v).encode("ascii", "ignore").decode() or "LAYER"
+
+# ================= Состояние =================
+PENDING = {}        # uid -> {rows, stats, chat_id, msg_id}
+SETTINGS = {}       # uid -> настройки (сохраняются между файлами)
+AWAIT_CODE = set()  # ждём текст константы
+
+DEFAULT = {
+    "sep": ";",       # ";" | "," | " " | "\t"
+    "code": "none",   # "none" | "layer" | "const"
+    "const": "PL",
+    "swap": True,     # True -> X=Север(dxf Y), Y=Восток(dxf X). Z НЕ трогаем
+    "decimals": 3,
+}
+
+SEP_SHORT = {";": "; Excel", ",": ", CSV", " ": "Пробел", "\t": "Tab"}
+SEP_LONG  = {";": "; (Excel)", ",": "запятая (CSV)", " ": "пробел", "\t": "Tab"}
+CB_SEP    = {"s_semi": ";", "s_comma": ",", "s_space": " ", "s_tab": "\t"}
+
+# ================= DXF: помощники =================
+def _entity_ocs(e):
+    """OCS из extrusion (код 210). None для обычной ПСК — всё уже в WCS."""
+    try:
+        return e.ocs()
+    except Exception:
+        return None
+
+def _wcs(ocs, p):
+    if ocs is not None:
+        try:
+            return ocs.to_wcs(p)
+        except Exception:
+            pass
+    return p
+
+def _lw_points(pl, use_ocs=True):
+    """LWPOLYLINE: Z = elevation (код 38) на ВСЮ полилинию, не на вершину."""
+    elev = float(pl.dxf.get("elevation", 0.0) or 0.0)
+    ocs = _entity_ocs(pl) if use_ocs else None
+    for x, y in pl.get_points("xy"):
+        yield _wcs(ocs, Vec3(float(x), float(y), elev))
+
+def _poly_type(pl):
+    """Тип старой POLYLINE, не привязываясь к версии ezdxf."""
+    t = getattr(pl, "polyline_type", None)       # ezdxf >= 1.x (Enum)
+    if callable(t):
+        try:
+            t = t()
+        except Exception:
+            t = None
+    if t is not None:
+        t = str(getattr(t, "name", t)).upper()
+        if any(ch.isalpha() for ch in t):
+            return t                             # POLYLINE_2D / _3D / POLYMESH / POLYFACE
+
+    flags = int(pl.dxf.get("flags", 0) or 0)     # fallback: биты кода 70
+    if flags & 64:
+        return "POLYFACE"
+    if flags & 16:
+        return "POLYMESH"
+    return "POLYLINE_3D" if (flags & 8) else "POLYLINE_2D"
+
+def _poly_points(pl, ptype, use_ocs=True):
+    """POLYLINE: у настоящей 3D каждая VERTEX хранит СВОЙ Z, уже в WCS."""
+    is_3d = ("3D" in ptype) and ("2D" not in ptype)
+    ocs = None if (is_3d or not use_ocs) else _entity_ocs(pl)
+    for v in pl.vertices:
+        yield _wcs(ocs, v.dxf.location)
+
+def _walk_insert(ins, depth=0):
+    """Разворачиваем INSERT рекурсивно (virtual_entities уже применяет матрицу)."""
+    if depth > 8:
+        return
+    for e in ins.virtual_entities():
+        if e.dxftype() == "INSERT":
+            yield from _walk_insert(e, depth + 1)
+        else:
+            yield e
+
+def is_mesh(ptype):
+    return any(k in ptype for k in ("POLYFACE", "POLYMESH", "MESH"))
+
+# ================= DXF: основной сбор =================
+def read_vertices(dxf_path):
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+    rows, n = [], 1
+    stats = {"poly": 0, "spline": 0, "block": 0, "line": 0}
+
+    def add(points, layer):
+        nonlocal n
+        for p in points:
+            rows.append((n, float(p[0]), float(p[1]), float(p[2]), layer))
+            n += 1
+
+    # 1. LWPOLYLINE — 99% чертежей (2D + общий elevation)
+    for pl in msp.query("LWPOLYLINE"):
+        stats["poly"] += 1
+        add(_lw_points(pl), pl.dxf.layer)
+
+    # 2. POLYLINE — в т.ч. НАСТОЯЩАЯ 3D с индивидуальным Z у каждой вершины
+    for pl in msp.query("POLYLINE"):
+        ptype = _poly_type(pl)
+        if is_mesh(ptype):
+            continue        # POLYFACE/POLYMESH: служебные VERTEX с (0,0,0) -> мусор
+        stats["poly"] += 1
+        add(_poly_points(pl, ptype), pl.dxf.layer)
+
+    # 3. Опция: узлы сплайнов / геликоидов (по кривой, а не контрольные точки)
+    if INCLUDE_SPLINES:
+        try:
+            from ezdxf.path import make_path
+        except ImportError as exc:
+            raise RuntimeError(
+                "Для SPLINE/HELIX нужен ezdxf >= 1.0: pip install -U ezdxf"
+            ) from exc
+        for e in list(msp.query("SPLINE")) + list(msp.query("HELIX")):
+            try:
+                pts = list(make_path(e).flattening(0.01))
+            except Exception:
+                continue
+            if pts:
+                add(pts, e.dxf.layer)
+                stats["spline"] += 1
+
+    # 4. Опция: полилинии внутри блоков (матрица INSERT уже учтена)
+    if INCLUDE_BLOCKS:
+        for ins in msp.query("INSERT"):
+            for e in _walk_insert(ins):
+                dt = e.dxftype()
+                if dt == "LWPOLYLINE":
+                    add(_lw_points(e, use_ocs=False), e.dxf.layer)
+                    stats["block"] += 1
+                elif dt == "POLYLINE":
+                    pt = _poly_type(e)
+                    if is_mesh(pt):
+                        continue
+                    add(_poly_points(e, pt, use_ocs=False), e.dxf.layer)
+                    stats["block"] += 1
+
+    # 5. Опция: концы отрезков и отдельные точки
+    if INCLUDE_LINES:
+        for e in msp.query("LINE"):
+            add((e.dxf.start, e.dxf.end), e.dxf.layer)
+            stats["line"] += 1
+        for e in msp.query("POINT"):
+            add((e.dxf.location,), e.dxf.layer)
+            stats["line"] += 1
+
+    return rows, stats
+
+# ======= Единый формат для TXT и PDF =======
+def header(s, for_pdf=False):
+    rus = CYRILLIC or not for_pdf       # TXT всегда кириллица (utf-8-sig)
+    h = ["№", "X", "Y", "Z"] if rus else ["No", "X", "Y", "Z"]
+    if s["code"] != "none":
+        h.append("Код" if rus else "Code")
+    return h
+
+def format_row(rec, s, for_pdf=False):
+    num, x, y, z, layer = rec
+    X, Y = (y, x) if s["swap"] else (x, y)   # swap только X<->Y, Z не меняем
+    d = s["decimals"]
+    out = [str(num), f"{X:.{d}f}", f"{Y:.{d}f}", f"{z:.{d}f}"]
+
+    if s["code"] != "none":
+        c = str(layer if s["code"] == "layer" else s["const"])
+        c = c.replace("\r", " ").replace("\n", " ").strip()
+        if for_pdf:
+            c = pdf_safe(c)                  # в PDF это ячейка, разделитель не важен
+        else:
+            c = c.replace(s["sep"], "_")     # запятая в слое не сделает 6-ю колонку
+            if s["sep"] in (" ", "\t"):
+                c = c.replace(" ", "_").replace("\t", "_")
+            if not c:
+                c = "_"
+        out.append(c)
+    return out
+
+def build_txt(rows, s):
+    sep = s["sep"]
+    lines = []
+    # Только для двойного клика в русском Excel (CREDO/pandas увидят лишнюю строку):
+    # if sep == ",":
+    #     lines.append("sep=,")
+    lines.append(sep.join(header(s)))
+    lines.extend(sep.join(format_row(r, s)) for r in rows)
+    return "\n".join(lines) + "\n"
+
+# ================= PDF =================
+def build_pdf(rows, s, path):
+    data = [header(s, True)] + [format_row(r, s, True) for r in rows]
+    page_w = landscape(A4)[0]
+    avail = page_w - 24 * mm
+
+    doc = SimpleDocTemplate(
+        path, pagesize=landscape(A4),
+        leftMargin=rightMargin=12 * mm,
+        topMargin=bottomMargin=12 * mm,
+        title="Coordinate list", author="DXF bot",
+    )
+
+    title = "Ведомость координат" if CYRILLIC else "Coordinate list"
+    info = (f"Точек: {len(rows)} | X=Север, Y=Восток | Z: WCS/elevation | Знаков: {s['decimals']}"
+            if CYRILLIC else
+            f"Points: {len(rows)} | X=North, Y=East | Z: WCS/elevation | Decimals: {s['decimals']}")
+    if not s["swap"]:
+        info = (info.replace("X=Север, Y=Восток", "как в AutoCAD")
+                    .replace("X=North, Y=East", "as in AutoCAD"))
+
+    cap = ParagraphStyle("cap", fontName=FONT, fontSize=10, leading=14)
+    story = [Paragraph(f"<b>{title}</b><br/>{info}", cap), Spacer(1, 6 * mm)]
+
+    weights = (0.08, 0.25, 0.25, 0.25, 0.17) if len(data[0]) == 5 \
+        else (0.10, 0.30, 0.30, 0.30)
+    tbl = LongTable(data, colWidths=[avail * w for w in weights], repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), FONT),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2F5597")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+        ("ALIGN", (0, 1), (0, -1), "CENTER"),
+        ("ALIGN", (1, 1), (3, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#B4C6E7")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#F2F6FC")]),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2),
+    ]))
+    story.append(tbl)
+
+    def footer(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont(FONT, 7)
+        canvas.setFillColor(colors.grey)
+        canvas.drawRightString(page_w - 12 * mm, 7 * mm, str(doc_.page))
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+
+# ================= Меню =================
+def tick(cond):
+    return "✅ " if cond else ""
+
+def kb(s):
+    sep_btn = [
+        InlineKeyboardButton(
+            text=tick(s["sep"] == val) + SEP_SHORT[val],
+            callback_data=cb
+        )
+        for cb, val in CB_SEP.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        sep_btn[:2],       # [ ; Excel ] [ , CSV ]
+        sep_btn[2:],       # [ Пробел  ] [ Tab   ]
+        [
+            InlineKeyboardButton(text=tick(s["code"] == "none") + "Без кода", callback_data="c_none"),
+            InlineKeyboardButton(text=tick(s["code"] == "layer") + "Код = слой", callback_data="c_layer"),
+            InlineKeyboardButton(text=tick(s["code"] == "const") + "Константа", callback_data="c_const"),
+        ],
+        [InlineKeyboardButton(
+            text=f"✏️ Изменить константу (сейчас: {s['const']})", callback_data="c_edit")],
+        [
+            InlineKeyboardButton(text=tick(s["swap"]) + "X=Север (геодезия)", callback_data="w_geo"),
+            InlineKeyboardButton(text=tick(not s["swap"]) + "Как в CAD", callback_data="w_cad"),
+        ],
+        [
+            InlineKeyboardButton(text=tick(s["decimals"] == 2) + "2 знака", callback_data="d_2"),
+            InlineKeyboardButton(text=tick(s["decimals"] == 3) + "3 знака", callback_data="d_3"),
+            InlineKeyboardButton(text=tick(s["decimals"] == 4) + "4 знака", callback_data="d_4"),
+        ],
+        [
+            InlineKeyboardButton(text="📄 TXT", callback_data="gen_txt"),
+            InlineKeyboardButton(text="📕 PDF", callback_data="gen_pdf"),
+            InlineKeyboardButton(text="📦 Оба", callback_data="gen_both"),
+        ],
+    ])
+
+def menu_text(uid):
+    p, s = PENDING[uid], SETTINGS[uid]
+    st = p["stats"]
+    src = f"Полилиний: <b>{st['poly']}</b>"
+    extra = []
+    if st["spline"]:
+        extra.append(f"сплайнов {st['spline']}")
+    if st["block"]:
+        extra.append(f"в блоках {st['block']}")
+    if st["line"]:
+        extra.append(f"LINE/POINT {st['line']}")
+    if extra:
+        src += " · " + " · ".join(extra)
+    src += f" · Вершин: <b>{len(p['rows'])}</b>"
+
+    code = {"none": "не выводится", "layer": "слой DXF",
+            "const": f"константа «{escape(s['const'])}»"}[s["code"]]
+    coord = "X=Север / Y=Восток" if s["swap"] else "как в AutoCAD"
+    return (f"⚙️ <b>Настройки выгрузки</b>\n"
+            f"{src}\n\n"
+            f"Колонки: <code>{escape(' '.join(header(s)))}</code>\n"
+            f"Разделитель: <b>{SEP_LONG[s['sep']]}</b> · Код: <b>{code}</b>\n"
+            f"Координаты: <b>{coord}</b> · Знаков: <b>{s['decimals']}</b>\n\n"
+            f"Нажми 📄 / 📕 / 📦")
+
+# ================= Хендлеры =================
+@dp.message(CommandStart())
+async def start(msg: Message):
+    SETTINGS.setdefault(msg.from_user.id, DEFAULT.copy())
+    await msg.answer(
+        "📐 Пришли `.dxf` — соберу вершины полилиний со сквозной нумерацией "
+        "и отдам TXT (`;`, `,`, пробел, Tab) и/или PDF.\n\n"
+        "✅ **3D‑полилинии**: у каждой вершины свой Z, уходит в 4‑ю колонку. "
+        "У 2D берётся `elevation`.\n\n"
+        "В меню: 5‑й столбец `Код` (слой / константа / выкл), точность и порядок X/Y.",
+        parse_mode="Markdown"
+    )
+
+@dp.message(F.document)
+async def handle_dxf(msg: Message):
+    name = (msg.document.file_name or "").lower()
+    if not name.endswith(".dxf"):
+        await msg.answer("⚠️ Нужен файл .dxf")
+        return
+
+    uid = msg.from_user.id
+    AWAIT_CODE.discard(uid)
+    tmp = f"in_{uid}.dxf"
+    await msg.answer("⏳ Читаю полилинии (в т.ч. 3D)...")
+
+    try:
+        f = await bot.get_file(msg.document.file_id)
+        await bot.download_file(f.file_path, destination=tmp)
+        rows, stats = read_vertices(tmp)
+    except Exception as e:
+        await msg.answer(f"❌ Не удалось прочитать DXF: {e}")
+        return
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)          # DXF сразу удаляем, дальше из памяти
+
+    if not rows:
+        await msg.answer(
+            "⚠️ Вершин не найдено. Если контур внутри блока — включи "
+            "<code>INCLUDE_BLOCKS = True</code> в начале скрипта.",
+            parse_mode="HTML")
+        return
+
+    PENDING[uid] = {"rows": rows, "stats": stats}
+    s = SETTINGS.setdefault(uid, DEFAULT.copy())
+    sent = await msg.answer(menu_text(uid), parse_mode="HTML", reply_markup=kb(s))
+    PENDING[uid]["chat_id"] = sent.chat.id
+    PENDING[uid]["msg_id"] = sent.message_id
+
+@dp.message(F.text)
+async def on_text(msg: Message):
+    uid = msg.from_user.id
+    txt = (msg.text or "").strip()
+
+    if uid in AWAIT_CODE:
+        if txt.lower() in ("/cancel", "/отмена"):
+            AWAIT_CODE.discard(uid)
+            await msg.answer("❌ Ввод кода отменён")
+            return
+        if txt.startswith("/"):
+            return
+        if not txt or len(txt) > 32:
+            await msg.answer("⚠️ Код: 1–32 символа одной строкой. Ещё раз (или /cancel):")
+            return
+
+        AWAIT_CODE.discard(uid)
+        s = SETTINGS.setdefault(uid, DEFAULT.copy())
+        s["const"], s["code"] = txt, "const"
+        esc = escape(txt)
+
+        if uid in PENDING:
+            text = f"✅ Код «{esc}» задан\n\n" + menu_text(uid)
+            p = PENDING[uid]
+            try:
+                await bot.edit_message_text(
+                    text, chat_id=p["chat_id"], message_id=p["msg_id"],
+                    parse_mode="HTML", reply_markup=kb(s))
+            except Exception:
+                await msg.answer(text, parse_mode="HTML", reply_markup=kb(s))
+        else:
+            await msg.answer(f"✅ Код «{esc}» сохранён. Теперь пришли .dxf")
+        return
+
+    if txt.startswith("/"):
+        return
+    if uid in PENDING:
+        await msg.answer("Нажми 📄 / 📕 / 📦 в меню выше 👆")
+    else:
+        await msg.answer("📐 Пришли .dxf — соберу ведомость координат")
+
+@dp.callback_query(F.data)
+async def on_btn(cb: CallbackQuery):
+    uid, d = cb.from_user.id, cb.data
+
+    if d.startswith("gen_"):
+        await do_generate(cb, uid, d)
+        return
+
+    if uid not in PENDING:
+        await cb.answer("Данные уже выгружены, пришли .dxf заново", show_alert=True)
+        return
+
+    s = SETTINGS.setdefault(uid, DEFAULT.copy())
+
+    if d == "c_edit":
+        AWAIT_CODE.add(uid)
+        await cb.answer()
+        await cb.message.answer(
+            "✏️ Отправь код одной строкой (например <code>PL</code>, <code>1</code>, "
+            "<code>ТЧК</code>) или /cancel:", parse_mode="HTML")
+        return
+
+    if d in CB_SEP:
+        s["sep"] = CB_SEP[d]
+    elif d == "c_none":
+        s["code"] = "none"
+    elif d == "c_layer":
+        s["code"] = "layer"
+    elif d == "c_const":
+        s["code"] = "const"
+    elif d == "w_geo":
+        s["swap"] = True
+    elif d == "w_cad":
+        s["swap"] = False
+    elif d in ("d_2", "d_3", "d_4"):
+        s["decimals"] = int(d[-1])
+
+    await cb.answer()
+    try:
+        await cb.message.edit_text(menu_text(uid), parse_mode="HTML", reply_markup=kb(s))
+    except Exception:
+        pass   # "message is not modified" при повторном нажатии той же кнопки
+
+async def do_generate(cb: CallbackQuery, uid: int, mode: str):
+    await cb.answer("⏳ Готовлю...")
+    p = PENDING.get(uid)
+    if not p:
+        await cb.message.answer("⚠️ Пришли .dxf заново")
+        return
+
+    s = SETTINGS.setdefault(uid, DEFAULT.copy())
+    rows = p["rows"]
+    made, ok = [], False
+
+    try:
+        if mode in ("gen_txt", "gen_both"):
+            fp = f"out_{uid}.txt"
+            with open(fp, "w", encoding="utf-8-sig") as f:
+                f.write(build_txt(rows, s))
+            txt_name = "points.txt"
+            # Хочешь именно .csv при запятой:
+            # txt_name = "points.csv" if s["sep"] == "," else "points.txt"
+            made.append((fp, txt_name))
+
+        if mode in ("gen_pdf", "gen_both"):
+            fp = f"out_{uid}.pdf"
+            build_pdf(rows, s, fp)
+            made.append((fp, "points.pdf"))
+
+        for fp, filename in made:
+            note = "" if filename.endswith(".pdf") else f"Разделитель: {SEP_LONG[s['sep']]}\n"
+            cap = (f"✅ Точек: {len(rows)}\n"
+                   f"Колонки: {' '.join(header(s))}\n"
+                   f"{note}"
+                   f"Координаты: {'X=Север / Y=Восток' if s['swap'] else 'как в AutoCAD'}\n"
+                   f"Z: из вершин 3D / elevation 2D")
+            await cb.message.answer_document(FSInputFile(fp, filename=filename), caption=cap)
+
+        ok = True
+        try:
+            await cb.message.edit_text(
+                "✅ Готово. Пришли новый .dxf 👇",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))  # реально убираем кнопки
+        except Exception:
+            pass
+    except Exception as e:
+        await cb.message.answer(f"❌ Ошибка генерации: {e}")
+    finally:
+        for fp, _ in made:
+            if os.path.exists(fp):
+                os.remove(fp)
+        if ok:
+            PENDING.pop(uid, None)   # настройки НЕ трогаем
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
